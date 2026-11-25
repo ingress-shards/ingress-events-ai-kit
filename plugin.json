@@ -1,0 +1,12 @@
+{
+  "name": "ingress-events-ai-kit",
+  "displayName": "Ingress Events AI Kit",
+  "version": "0.1.0",
+  "description": "Shared rules, on-demand skills, and command guardrail hooks for the Ingress Shards repositories.",
+  "repository": "https://github.com/ingress-shards/ingress-events-ai-kit",
+  "suggestedPrompts": [
+    "Prepare git commits for the current changes",
+    "Walk through cross-repo release steps for ingress-events-core",
+    "Sync all repositories after a release"
+  ]
+}

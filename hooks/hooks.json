@@ -1,0 +1,29 @@
+{
+  "description": "Deterministic command guardrails and post-build artifact cleanup for Ingress Shards repositories.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/guard-claude.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/clean-artifacts.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
