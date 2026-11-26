@@ -41,7 +41,7 @@ ingress-events-ai-kit/
 │   └── guard-claude.mjs            # Thin Claude Code stdin/stdout adapter
 ├── skills/
 │   ├── prepare-commits/SKILL.md    # semantic-release & Conventional Commits workflow
-│   ├── post-release-sync/          # Cross-platform tag/branch sync across the 3 product repos
+│   ├── post-release-sync/          # Cross-platform status summary & tag/branch sync across all 4 repos
 │   ├── cross-repo-release/SKILL.md # Local sync-to-siblings.js & SemVer release flow
 │   ├── season-setup/SKILL.md       # Start-of-season code impact check & manifest/blueprint build
 │   └── weekend-data-update/SKILL.md# Post-weekend raw data ingestion & validation
