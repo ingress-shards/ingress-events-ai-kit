@@ -12,8 +12,8 @@ description: >-
 Before drafting any commits, confirm the workspace is clean and validated:
 1. Ensure local validation (`yarn --cwd <repo> validate` or `npm --prefix <repo> run validate`) has passed after the last edit.
 2. Check for leftover build artifacts (`tsconfig.tsbuildinfo`, `yarn-error.log`) and remove them if present.
-3. Inspect pending changes using `git -C <repo> status -s` and `git -C <repo> diff` (never pass ad-hoc file paths to `git diff`).
-4. Fetch and check the current released version via git tags: `git -C <repo> fetch --tags` then `git -C <repo> tag --sort=-v:refname` (never edit `"version": "0.0.0-semantically-released"` in `package.json`).
+3. Inspect the active branch and pending changes using `git -C <repo> branch --show-current`, `git -C <repo> status -s`, and `git -C <repo> diff` (never pass ad-hoc file paths to `git diff`).
+4. **Release version check (`main` only):** Skip remote/tag version checks on non-`main` feature or integration branches (and in repos without `semantic-release`, such as `ingress-events-ai-kit`). Only when on `main`—or when explicitly checking the current/next released version—inspect local tags via `git -C <repo> tag --sort=-v:refname` (run `git -C <repo> fetch --tags` first only if local tags may be stale). Never edit `"version": "0.0.0-semantically-released"` in `package.json`.
 
 ## 2. Conventional Commits (`semantic-release`)
 Versions are determined strictly from commit messages on `main`:
