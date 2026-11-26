@@ -1,118 +1,208 @@
-import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
+/**
+ * Shared PreToolUse command guardrail engine for Ingress Shards repositories.
+ *
+ * Consumed by `scripts/guard-antigravity.mjs` and `scripts/guard-claude.mjs`
+ * (and tested directly by `tests/evaluate-command.test.mjs`).
+ *
+ * Evaluation precedence:
+ *   1. Outside Ingress Shards workspaces -> `ask` (pass through untouched)
+ *   2. Hard blocks (`deny`) -> `.secrets` shell access, local Docker, npm/Yarn stack mixups
+ *   3. Forced confirmations (`force_ask`) -> mutating `git` commands, `sync.mjs` without `--dry-run`
+ *   4. Data-driven allowlist (`allow`) -> every command segment passes safety gate + matches `examples/antigravity-permissions.json`
+ *      (`guard-antigravity.mjs` maps `'allow'` -> `'auto_approve'`; `guard-claude.mjs` emits `'allow'`)
+ *   5. Everything else -> `ask`
+ */
 
-const PRODUCT_REPO_NAMES = [
-  'ingress-events-core',
-  'iitc-plugin-site-observer',
-  'ingress-shards.github.io'
-];
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+// ============================================================================
+// 1. Workspace & Repo Classification Patterns
+// ============================================================================
+
+const PRODUCT_REPO_NAMES = ['ingress-events-core', 'iitc-plugin-site-observer', 'ingress-shards.github.io'];
+
+// Case-insensitive directory match for the umbrella folder or any of the 4 standalone repos.
 const INGRESS_PATH_PATTERN =
   /(?:^|\/)(ingress-shards|ingress-events-core|iitc-plugin-site-observer|ingress-shards\.github\.io|ingress-events-ai-kit)(?:\/|$)/i;
 
-const SECRETS_REF_PATTERN = /(?:^|[\s"'`\\/<>])\.secrets(?:$|[\s"'`\\/>])/i;
+// Matches `.secrets` as a standalone path/arg token (including redirections like `>.secrets` or `--env-file=.secrets`),
+// checked across the entire unsplit command line so chained commands cannot slip through.
+const SECRETS_REF_PATTERN = /(?:^|[\s"'`\\/<>=;|&(])\.secrets(?:$|[\s"'`\\/>;|&)])/i;
 
-const POWERSHELL_CMDLET_PATTERN =
-  /\b(Get-ChildItem|Get-Content|Set-Content|Add-Content|Select-Object|Select-String|Test-Path|ForEach-Object|Where-Object|Push-Location|Pop-Location|Set-Location|Remove-Item|Copy-Item|Move-Item|New-Item|Out-File)\b/i;
+// Package-manager partitioning:
+// - Negative lookbehind prevents npm installs of `@ingress-shards/ingress-events-core` from tripping Yarn checks.
+const YARN_REPO_PATTERN = /(?<!@ingress-shards\/)\b(ingress-events-core|iitc-plugin-site-observer)\b/i;
+const NPM_REPO_PATTERN = /\b(ingress-shards\.github\.io|ingress-events-ai-kit)\b/i;
+const IN_YARN_REPO_PATTERN = /(?:^|\/)(ingress-events-core|iitc-plugin-site-observer)(?:\/|$)/;
+const IN_NPM_REPO_PATTERN = /(?:^|\/)(ingress-shards\.github\.io|ingress-events-ai-kit)(?:\/|$)/;
 
-const SHELL_INSPECT_PATTERN = /^(cat|type|head|sed)$/i;
-const DOCKER_PATTERN = /^(docker\b|.*validate:docker\b)/i;
+// ============================================================================
+// 2. Command-Start & Guardrail Patterns
+// ============================================================================
 
-const YARN_REPOS_PATTERN = /(?<!@ingress-shards\/)\b(ingress-events-core|iitc-plugin-site-observer)\b/i;
-const NPM_REPOS_PATTERN = /\bingress-shards\.github\.io\b/i;
+// Allows leading env assignments (`FOO=1 cmd`) and `env -i cmd`, plus optional absolute/relative binary paths and `.cmd`/`.exe`.
+const CMD_PREFIX = '^\\s*(?:(?:[A-Za-z_]\\w*=\\S+\\s+)|(?:env\\s+(?:-\\S+\\s+)*))*';
+const EXEC_PATH = '(?:[^\\s"\'`]*[\\\\/])?';
+const NPM_CMD_PATTERN = new RegExp(`${CMD_PREFIX}(?:corepack\\s+)?${EXEC_PATH}npm(?:\\.(?:cmd|exe))?\\b`, 'i');
+const YARN_CMD_PATTERN = new RegExp(`${CMD_PREFIX}(?:corepack\\s+)?${EXEC_PATH}yarn(?:\\.(?:cmd|exe))?\\b`, 'i');
+const DOCKER_CMD_PATTERN = new RegExp(
+  `${CMD_PREFIX}${EXEC_PATH}(?:docker(?:\\.exe)?\\b|(?:corepack\\s+)?${EXEC_PATH}(?:yarn|npm)(?:\\.(?:cmd|exe))?\\b[^\\n]*\\bvalidate:docker\\b)`,
+  'i'
+);
 
-const READ_ONLY_GIT_SUBCOMMANDS = new Set([
-  'status',
-  'diff',
-  'log',
-  'show',
-  'fetch',
-  'grep',
-  'rev-parse',
-  'describe',
-  'ls-files',
-  'ls-remote',
-  'shortlog',
-  'rev-list',
-  'cat-file',
-  'merge-base',
-  'check-ignore'
-]);
+// Matches mutating git commands after skipping leading global flags (e.g., `-C <repo>` or `--no-pager`):
+// - Unconditionally mutating subcommands (`commit`, `push`, `add`, `checkout`, `worktree`, etc.)
+// - Mutating forms of `branch` / `tag` (delete/move/rename/create, while allowing read-only `-a`, `--merged`, `--show-current`, `--list`)
+// - `stash` except `stash list` / `stash show`
+// - Mutating `remote` subcommands (while allowing `remote -v` / `remote show`)
+const MUTATING_GIT_PATTERN = new RegExp(
+  `${CMD_PREFIX}${EXEC_PATH}git(?:\\.exe)?\\b(?:\\s+(?:-[Cc]\\s+(?:"[^"]+"|'[^']+'|\\S+)|-\\S+))*\\s+(?:(?:commit|push|pull|add|rm|mv|restore|checkout|switch|merge|rebase|reset|cherry-pick|revert|init|worktree|clean|am|apply)\\b|branch\\s+(?:-[A-Za-z]*[dDmMcCfl][A-Za-z]*\\b|--(?:delete|move|copy|force|set-upstream-to|unset-upstream|edit-description|create-reflog)\\b|[^-\\s])|tag\\s+(?:-[A-Za-z]*[dasfm][A-Za-z]*\\b|--(?:delete|annotate|sign|force|message)\\b|[^-\\s])|stash\\b(?:\\s+(?!list\\b|show\\b)|\\s*$)|remote\\s+(?:add|remove|rm|rename|set-url|prune|update)\\b)`,
+  'i'
+);
 
-const DIFF_FLAGS_WITH_VALUE = new Set([
-  '-U',
-  '--unified',
-  '--diff-filter',
-  '-S',
-  '-G',
-  '-O',
-  '--src-prefix',
-  '--dst-prefix',
-  '--output',
-  '--word-diff-regex',
-  '--inter-hunk-context'
-]);
+// Post-release sync script; safe only when `--dry-run` is present in the same command segment.
+const SYNC_SCRIPT_PATTERN = /(?:^|[\s"'`\\/])sync\.mjs(?:$|[\s"'`])/i;
 
-const BRANCH_READ_ONLY_FLAGS_WITH_VALUE = new Set([
-  '--merged',
-  '--no-merged',
-  '--contains',
-  '--no-contains',
-  '--points-at',
-  '--sort',
-  '--format',
-  '--list'
-]);
+const ANTIGRAVITY_PERMISSIONS_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '../examples/antigravity-permissions.json'
+);
 
-const BRANCH_MUTATING_FLAGS = new Set([
-  '-l',
-  '--delete',
-  '--move',
-  '--copy',
-  '--force',
-  '--set-upstream-to',
-  '--unset-upstream',
-  '--edit-description',
-  '--create-reflog'
-]);
+// ============================================================================
+// 3. Data-Driven Allowlist Compilation (`examples/antigravity-permissions.json`)
+// ============================================================================
 
-const TAG_MUTATING_FLAGS = new Set([
-  '--delete',
-  '--annotate',
-  '--sign',
-  '--force',
-  '--message'
-]);
+/**
+ * Compiles a `command(...)` or `command(regex:...)` rule entry into per-token matchers.
+ *
+ * Antigravity evaluates `command(regex:...)` rules whitespace-token by whitespace-token
+ * (`^(?:token)$`), with an optional trailing `.*` token enabling variable extra arguments.
+ */
+export function compileAllowRule(rule) {
+  if (typeof rule !== 'string') return null;
 
-const TAG_READ_ONLY_FLAGS = new Set([
-  '-l',
-  '--list',
-  '-v',
-  '--verify',
-  '--sort',
-  '--merged',
-  '--no-merged',
-  '--contains',
-  '--points-at'
-]);
+  if (rule.startsWith('command(regex:') && rule.endsWith(')')) {
+    const inner = rule.slice('command(regex:'.length, -1).trim();
+    if (!inner) return null;
+    const rawTokens = inner.split(/\s+/);
+    const allowTrailing = rawTokens[rawTokens.length - 1] === '.*';
+    const patternTokens = allowTrailing ? rawTokens.slice(0, -1) : rawTokens;
+    // Reject bare `command(regex:.*)` so an empty prefix can never become a catch-all auto-allow rule.
+    if (patternTokens.length === 0) return null;
+    try {
+      const tokens = patternTokens.map((token) => new RegExp(`^(?:${token})$`));
+      return { tokens, isRegex: true, allowTrailing };
+    } catch (error) {
+      console.error(`[evaluate-command] Invalid allow regex rule "${rule}":`, error);
+      return null;
+    }
+  }
 
-const GIT_GLOBAL_FLAGS_WITH_VALUE = new Set([
-  '-C',
-  '-c',
-  '--git-dir',
-  '--work-tree',
-  '--namespace',
-  '--super-prefix',
-  '--config-env'
-]);
+  if (rule.startsWith('command(') && rule.endsWith(')')) {
+    const inner = rule.slice('command('.length, -1).trim();
+    if (!inner) return null;
+    return { tokens: inner.split(/\s+/), isRegex: false, allowTrailing: false };
+  }
 
-const KNOWN_SAFE_ROOT_PATTERNS = [
-  /^(?:corepack )?yarn --cwd (?:ingress-events-core|iitc-plugin-site-observer) validate$/,
-  /^npm --prefix ingress-shards\.github\.io run validate$/,
-  /^npm --prefix ingress-events-ai-kit test$/,
-  /^git -C (?:ingress-events-core|iitc-plugin-site-observer|ingress-shards\.github\.io|ingress-events-ai-kit) (?:status -s|diff --stat)$/,
-  /^git (?:status -s|diff --stat)$/
-];
+  return null;
+}
+
+/**
+ * Loads and compiles `permissionGrants.allow` rules from `examples/antigravity-permissions.json`
+ * once at module load so the JSON template stays the single source of truth.
+ */
+function loadDefaultAllowRules() {
+  try {
+    const parsed = JSON.parse(readFileSync(ANTIGRAVITY_PERMISSIONS_PATH, 'utf8'));
+    const raw = Array.isArray(parsed?.permissionGrants?.allow) ? parsed.permissionGrants.allow : [];
+    return raw.map(compileAllowRule).filter(Boolean);
+  } catch (error) {
+    console.error('[evaluate-command] Failed to load allow rules:', error);
+    return [];
+  }
+}
+
+const DEFAULT_ALLOW_RULES = loadDefaultAllowRules();
+
+// ============================================================================
+// 4. Allowlist Safety Gate & Segment Matching
+// ============================================================================
+
+/**
+ * Detects shell syntax that is unsafe or shell-ambiguous to auto-approve under trailing `.*`
+ * allow rules: unclosed quotes, backslash-escaped quotes (`\'`, `\"`), command substitutions
+ * (`$(...)`, backticks), unquoted redirections (`<`, `>`), and unquoted parentheses (`(`, `)`).
+ *
+ * Inside single quotes `'...'`, `$()`, backticks, `<`, `>`, and `()` are literal characters in
+ * POSIX/PowerShell and are permitted (e.g., `git grep '$(literal)'`), unless the quote itself is unclosed.
+ */
+function hasUnsafeShellSyntax(segment) {
+  let quote = null;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i];
+    const next = segment[i + 1];
+
+    if (quote) {
+      if (quote === '"' && ch === '\\') {
+        // `\"` escapes inside bash double quotes but terminates strings in PowerShell/`cmd.exe`.
+        if (next === '"') return true;
+        if (next === '\\') {
+          i++;
+          continue;
+        }
+      }
+      if (ch === quote) {
+        quote = null;
+        continue;
+      }
+      // Double quotes still expand backticks and `$(...)` in POSIX shells and PowerShell.
+      if (quote === '"' && (ch === '`' || (ch === '$' && next === '('))) {
+        return true;
+      }
+      continue;
+    }
+
+    // Backslash-escaped quotes outside quotes mean different things in bash vs. PowerShell/`cmd.exe`.
+    if (ch === '\\' && (next === "'" || next === '"')) {
+      return true;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    // Reject backticks, I/O redirections, `$(...)`, and unquoted parentheses (PowerShell/fish subexpressions).
+    if (ch === '`' || ch === '>' || ch === '<' || ch === '(' || ch === ')' || (ch === '$' && next === '(')) {
+      return true;
+    }
+  }
+  // Unclosed quotes can leave the rest of a line active in shells like `cmd.exe` (which ignores `'`).
+  return quote !== null;
+}
+
+/**
+ * Returns true when a single command segment passes the unsafe-syntax check and matches
+ * at least one compiled allow rule.
+ */
+function segmentMatchesAllowRules(segment, allowRules) {
+  if (!segment || hasUnsafeShellSyntax(segment)) return false;
+  const segTokens = segment.trim().split(/\s+/).filter(Boolean);
+  if (segTokens.length === 0 || !Array.isArray(allowRules)) return false;
+
+  return allowRules.some((rule) => {
+    if (rule.allowTrailing ? segTokens.length < rule.tokens.length : segTokens.length !== rule.tokens.length) {
+      return false;
+    }
+    return rule.tokens.every((matcher, idx) =>
+      rule.isRegex ? matcher.test(segTokens[idx]) : segTokens[idx] === matcher
+    );
+  });
+}
+
+// ============================================================================
+// 5. Workspace Detection (Scoped Activation)
+// ============================================================================
 
 function normalizePath(value) {
   return String(value ?? '').replace(/\\/g, '/').toLowerCase();
@@ -121,6 +211,8 @@ function normalizePath(value) {
 /**
  * Checks whether the current working directory or any active workspace path
  * belongs to the Ingress Shards repositories.
+ * Matches directory names first, then falls back to checking for sibling product repos on disk
+ * so custom parent folders (e.g., temp test dirs or renamed umbrellas) still activate guardrails.
  */
 export function isIngressWorkspace(cwd = '', workspacePaths = []) {
   const candidates = [cwd, ...(Array.isArray(workspacePaths) ? workspacePaths : [])].filter(Boolean);
@@ -141,10 +233,19 @@ export function isIngressWorkspace(cwd = '', workspacePaths = []) {
   return false;
 }
 
+// ============================================================================
+// 6. Command Segment Splitter
+// ============================================================================
+
 /**
- * Splits a shell command string on `&&`, `||`, `;`, `|`, `&`, and newlines outside quoted segments.
+ * Splits a shell command string on unquoted `&&`, `||`, `;`, `|`, `&`, and newlines,
+ * preserving `&` inside shell redirections such as `2>&1` or `<&0`.
+ *
+ * Intentionally avoids entering quote mode on unclosed delimiters or backslash-escaped
+ * quotes (`\'`, `\"`, `` \` ``) so malformed/crafted prefixes cannot hide chained
+ * `docker` or `git push` segments from per-segment guardrail checks.
  */
-function splitSegments(commandLine) {
+function splitCommandSegments(commandLine) {
   const segments = [];
   let current = '';
   let quote = null;
@@ -154,37 +255,33 @@ function splitSegments(commandLine) {
     const next = commandLine[i + 1];
 
     if (quote) {
-      if (ch === '\\' && quote === '"' && i + 1 < commandLine.length) {
-        current += ch + next;
-        i++;
-        continue;
-      }
-      if (ch === quote) {
-        quote = null;
-      }
+      if (ch === quote) quote = null;
       current += ch;
       continue;
     }
 
-    if (ch === '"' || ch === "'") {
+    if (ch === '\\' && (next === "'" || next === '"' || next === '`')) {
+      current += ch + next;
+      i++;
+      continue;
+    }
+
+    if ((ch === '"' || ch === "'" || ch === '`') && commandLine.indexOf(ch, i + 1) !== -1) {
       quote = ch;
       current += ch;
       continue;
     }
 
     if ((ch === '&' && next === '&') || (ch === '|' && next === '|')) {
-      if (current.trim()) {
-        segments.push(current.trim());
-      }
+      if (current.trim()) segments.push(current.trim());
       current = '';
       i++;
       continue;
     }
 
-    if (ch === ';' || ch === '|' || ch === '&' || ch === '\n' || ch === '\r') {
-      if (current.trim()) {
-        segments.push(current.trim());
-      }
+    const isRedirectionAmp = ch === '&' && (commandLine[i - 1] === '>' || commandLine[i - 1] === '<');
+    if (!isRedirectionAmp && (ch === ';' || ch === '|' || ch === '&' || ch === '\n' || ch === '\r')) {
+      if (current.trim()) segments.push(current.trim());
       current = '';
       continue;
     }
@@ -192,333 +289,83 @@ function splitSegments(commandLine) {
     current += ch;
   }
 
-  if (current.trim()) {
-    segments.push(current.trim());
-  }
-
+  if (current.trim()) segments.push(current.trim());
   return segments;
 }
 
+// ============================================================================
+// 7. Stack Isolation (`npm` vs. `Yarn` per Repo)
+// ============================================================================
+
 /**
- * Tokenizes a single command segment while respecting quotes.
+ * Extracts an explicit `--prefix`/`-C` or `--cwd` target path, returning `null` for `.`/`./`
+ * so relative current-directory invocations fall back to `cwd` resolution.
  */
-function tokenize(segment) {
-  const tokens = [];
-  let current = '';
-  let quote = null;
-
-  for (let i = 0; i < segment.length; i++) {
-    const ch = segment[i];
-    if (quote) {
-      if (ch === '\\' && quote === '"' && i + 1 < segment.length) {
-        current += segment[i + 1];
-        i++;
-        continue;
-      }
-      if (ch === quote) {
-        quote = null;
-        continue;
-      }
-      current += ch;
-      continue;
-    }
-
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      continue;
-    }
-
-    if (/\s/.test(ch)) {
-      if (current.length > 0) {
-        tokens.push(current);
-        current = '';
-      }
-      continue;
-    }
-
-    current += ch;
-  }
-
-  if (current.length > 0) {
-    tokens.push(current);
-  }
-
-  return tokens;
-}
-
-function normalizeExecutableName(token) {
-  const clean = basename(String(token ?? '').replace(/\\/g, '/')).toLowerCase();
-  return clean.replace(/\.(exe|cmd|bat)$/i, '');
+function extractFlagTarget(segment, flagPattern) {
+  const match = segment.match(flagPattern);
+  const value = (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+  return !value || /^\.[\\/]?$/.test(value) ? null : value;
 }
 
 /**
- * Strips leading `KEY=VALUE` assignments and `env` wrappers, returning normalized executable + args.
+ * Enforces npm vs. Yarn stack isolation per command segment using explicit target flags or `cwd` fallback.
+ * When an explicit target (`--prefix`/`-C`/`--cwd`) is present, it overrides `cwd` so cross-repo
+ * commands like `npm --prefix ingress-shards.github.io test` succeed from a Yarn `cwd`.
  */
-function unwrapCommandTokens(tokens) {
-  let idx = 0;
-  while (idx < tokens.length) {
-    const token = tokens[idx];
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
-      idx++;
-      continue;
-    }
-    if (normalizeExecutableName(token) === 'env') {
-      idx++;
-      while (idx < tokens.length && tokens[idx].startsWith('-')) {
-        const flag = tokens[idx];
-        idx++;
-        if ((flag === '-u' || flag === '--unset') && idx < tokens.length) {
-          idx++;
-        }
-      }
-      continue;
-    }
-    break;
-  }
-
-  const sliced = tokens.slice(idx);
-  const command = sliced.length > 0 ? normalizeExecutableName(sliced[0]) : '';
-  return { command, tokens: sliced };
-}
-
-const NODE_FLAGS_WITH_VALUE = new Set([
-  '-r',
-  '--require',
-  '--import',
-  '--input-type',
-  '--loader',
-  '--conditions',
-  '-C',
-  '--env-file'
-]);
-
-function isInlineNodeEval(tokens) {
-  for (let i = 1; i < tokens.length; i++) {
-    const arg = tokens[i];
-    if (arg === '--') {
-      return false;
-    }
-    if (
-      arg === '-e' ||
-      arg === '--eval' ||
-      arg.startsWith('--eval=') ||
-      arg === '-p' ||
-      arg === '--print' ||
-      arg.startsWith('--print=') ||
-      /^-[a-z]*[ep][a-z]*$/i.test(arg)
-    ) {
-      return true;
-    }
-    if (arg.startsWith('-')) {
-      if (NODE_FLAGS_WITH_VALUE.has(arg) && i + 1 < tokens.length) {
-        i++;
-      }
-      continue;
-    }
-    return false;
-  }
-  return false;
-}
-
-function parseGitCommand(tokens) {
-  let idx = 1;
-  while (idx < tokens.length && tokens[idx].startsWith('-')) {
-    const flag = tokens[idx];
-    idx++;
-    if (GIT_GLOBAL_FLAGS_WITH_VALUE.has(flag) && idx < tokens.length) {
-      idx++;
-    }
-  }
-
-  return {
-    subcommand: tokens[idx]?.toLowerCase() ?? '',
-    rest: tokens.slice(idx + 1)
-  };
-}
-
-function hasDiffPositionalArgs(rest) {
-  for (let i = 0; i < rest.length; i++) {
-    const arg = rest[i];
-    if (arg === '--') {
-      return true;
-    }
-    if (arg.startsWith('-')) {
-      if (DIFF_FLAGS_WITH_VALUE.has(arg) && i + 1 < rest.length) {
-        i++;
-      }
-      continue;
-    }
-    return true;
-  }
-  return false;
-}
-
-function isReadOnlyBranch(rest) {
-  for (let i = 0; i < rest.length; i++) {
-    const arg = rest[i];
-    const flagName = arg.split('=')[0];
-    if (/^-[dDmMcCfl]+$/.test(arg) || BRANCH_MUTATING_FLAGS.has(flagName)) {
-      return false;
-    }
-    if (arg.startsWith('-')) {
-      if (BRANCH_READ_ONLY_FLAGS_WITH_VALUE.has(arg) && i + 1 < rest.length && !rest[i + 1].startsWith('-')) {
-        i++;
-      }
-      continue;
-    }
-    return false;
-  }
-  return true;
-}
-
-function isReadOnlyTag(rest) {
-  if (rest.length === 0) {
-    return true;
-  }
-  const hasMutatingFlag = rest.some((arg) => {
-    const flagName = arg.split('=')[0];
-    return /^-[dasfm]+$/.test(arg) || TAG_MUTATING_FLAGS.has(flagName);
-  });
-  if (hasMutatingFlag) {
-    return false;
-  }
-  return rest.some((arg) => {
-    const flagName = arg.split('=')[0];
-    return TAG_READ_ONLY_FLAGS.has(flagName);
-  });
-}
-
-function isReadOnlyRemote(rest) {
-  if (rest.length === 0) {
-    return true;
-  }
-  const first = rest[0]?.toLowerCase();
-  if (rest.length === 1 && (first === '-v' || first === '--verbose')) {
-    return true;
-  }
-  return first === 'show' || first === 'get-url';
-}
-
-function isReadOnlyConfig(rest) {
-  const mutatingConfigFlags = new Set([
-    '--unset',
-    '--unset-all',
-    '--add',
-    '--replace-all',
-    '--rename-section',
-    '--remove-section'
-  ]);
-  const readOnlyConfigFlags = new Set(['--get', '--get-all', '--list', '-l']);
-
-  if (rest.some((arg) => mutatingConfigFlags.has(arg.split('=')[0]))) {
-    return false;
-  }
-  return rest.some((arg) => readOnlyConfigFlags.has(arg.split('=')[0]));
-}
-
-function evaluateGitSegment(tokens) {
-  const { subcommand, rest } = parseGitCommand(tokens);
-  if (!subcommand) {
-    return { action: 'ask' };
-  }
-
-  if (subcommand === 'diff') {
-    if (hasDiffPositionalArgs(rest)) {
+function evaluateStackViolation(segment, normalizedCwd) {
+  if (NPM_CMD_PATTERN.test(segment)) {
+    // `--prefix` is case-insensitive only in our pattern, while `-C` must stay uppercase (not npm `-c`).
+    const target = extractFlagTarget(
+      segment,
+      /(?:^|\s)(?:--[pP][rR][eE][fF][iI][xX]|-C)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/
+    );
+    const bad = target
+      ? YARN_REPO_PATTERN.test(target)
+      : YARN_REPO_PATTERN.test(segment) ||
+        (IN_YARN_REPO_PATTERN.test(normalizedCwd) && !NPM_REPO_PATTERN.test(segment));
+    if (bad) {
       return {
         action: 'deny',
-        reason:
-          'Passing file paths or positional args to `git diff` is forbidden (breaks permission caching). Use native file read tools or plain `git -C <repo> diff` / `git -C <repo> diff --stat`.'
+        reason: 'Stack violation: `ingress-events-core` and `iitc-plugin-site-observer` use Yarn, not npm.'
       };
     }
-    return { action: 'ask' };
   }
 
-  if (READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) {
-    return { action: 'ask' };
-  }
-
-  if (subcommand === 'branch' && isReadOnlyBranch(rest)) {
-    return { action: 'ask' };
-  }
-
-  if (subcommand === 'tag' && isReadOnlyTag(rest)) {
-    return { action: 'ask' };
-  }
-
-  if (subcommand === 'stash' && ['list', 'show'].includes(rest[0]?.toLowerCase())) {
-    return { action: 'ask' };
-  }
-
-  if (subcommand === 'remote' && isReadOnlyRemote(rest)) {
-    return { action: 'ask' };
-  }
-
-  if (subcommand === 'config' && isReadOnlyConfig(rest)) {
-    return { action: 'ask' };
-  }
-
-  return {
-    action: 'force_ask',
-    reason: 'Non-read-only git commands require explicit user approval ("Execute git commands").'
-  };
-}
-
-function detectPackageManager(command, tokens) {
-  if (command === 'npm') {
-    return 'npm';
-  }
-  if (command === 'yarn') {
-    return 'yarn';
-  }
-  if (command === 'corepack') {
-    const sub = normalizeExecutableName(tokens[1]);
-    if (sub === 'yarn' || sub === 'npm') {
-      return sub;
+  if (YARN_CMD_PATTERN.test(segment)) {
+    const target = extractFlagTarget(segment, /(?:^|\s)--cwd(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+    const bad = target
+      ? NPM_REPO_PATTERN.test(target)
+      : NPM_REPO_PATTERN.test(segment) ||
+        (IN_NPM_REPO_PATTERN.test(normalizedCwd) && !YARN_REPO_PATTERN.test(segment));
+    if (bad) {
+      return {
+        action: 'deny',
+        reason: 'Stack violation: `ingress-shards.github.io` and `ingress-events-ai-kit` use npm, not Yarn.'
+      };
     }
   }
+
   return null;
 }
 
-function isKnownSafeSingleCommand(commandLine, normalizedCwd) {
-  const normalizedCmd = commandLine.trim().replace(/\s+/g, ' ');
-  if (KNOWN_SAFE_ROOT_PATTERNS.some((pattern) => pattern.test(normalizedCmd))) {
-    return true;
-  }
-
-  if (
-    /^(?:corepack )?yarn validate$/.test(normalizedCmd) &&
-    /(?:^|\/)(?:ingress-events-core|iitc-plugin-site-observer)(?:\/|$)/.test(normalizedCwd)
-  ) {
-    return true;
-  }
-
-  if (
-    /^npm run validate$/.test(normalizedCmd) &&
-    /(?:^|\/)ingress-shards\.github\.io(?:\/|$)/.test(normalizedCwd)
-  ) {
-    return true;
-  }
-
-  if (
-    /^node --test$/.test(normalizedCmd) &&
-    /(?:^|\/)ingress-events-ai-kit(?:\/|$)/.test(normalizedCwd)
-  ) {
-    return true;
-  }
-
-  return false;
-}
+// ============================================================================
+// 8. Main Evaluation Pipeline
+// ============================================================================
 
 /**
- * Evaluates a shell command against Ingress Shards workspace guardrails.
+ * Evaluates Ingress Shards workspace guardrails and data-driven allow rules from
+ * `examples/antigravity-permissions.json`.
  */
-export function evaluateCommand(commandLine, { cwd = '', workspacePaths = [] } = {}) {
-  if (!commandLine || !isIngressWorkspace(cwd, workspacePaths)) {
+export function evaluateCommand(
+  commandLine,
+  { cwd = '', workspacePaths = [], inWorkspace, allowRules = DEFAULT_ALLOW_RULES } = {}
+) {
+  // Stage 1: Pass through outside Ingress Shards workspaces (never impose repo rules on unrelated projects).
+  if (!commandLine || !(inWorkspace ?? isIngressWorkspace(cwd, workspacePaths))) {
     return { action: 'ask' };
   }
 
-  const normalizedCwd = normalizePath(cwd);
-
+  // Stage 2: Pre-split `.secrets` check across the entire command line.
   if (SECRETS_REF_PATTERN.test(commandLine)) {
     return {
       action: 'deny',
@@ -526,92 +373,37 @@ export function evaluateCommand(commandLine, { cwd = '', workspacePaths = [] } =
     };
   }
 
-  if (POWERSHELL_CMDLET_PATTERN.test(commandLine)) {
-    return {
-      action: 'deny',
-      reason: 'PowerShell cmdlets are forbidden. Use native file tools or cross-platform CLI tools.'
-    };
-  }
+  const normalizedCwd = normalizePath(cwd);
+  const segments = splitCommandSegments(commandLine);
+  // Defer `force_ask` until all segments are scanned so a later `deny` still beats an earlier `force_ask`.
+  let pendingForceAsk = null;
 
-  const segments = splitSegments(commandLine);
-
+  // Stage 3: Per-segment hard blocks (`deny`) and forced confirmations (`force_ask`).
   for (const segment of segments) {
-    const rawTokens = tokenize(segment);
-    const { command, tokens } = unwrapCommandTokens(rawTokens);
-
-    if (command === 'cd' && segments.length > 1) {
-      return {
-        action: 'deny',
-        reason: 'Chained `cd` commands are forbidden. Use `yarn --cwd <repo>`, `npm --prefix <repo>`, or `git -C <repo>`.'
-      };
-    }
-
-    if (SHELL_INSPECT_PATTERN.test(command) || (command === 'node' && isInlineNodeEval(tokens))) {
-      return {
-        action: 'deny',
-        reason: 'Shell file-inspection commands (cat, type, head, sed, node -e/-p) are forbidden. Use native file read tools.'
-      };
-    }
-
-    if (command === 'docker' || DOCKER_PATTERN.test(segment)) {
+    if (DOCKER_CMD_PATTERN.test(segment)) {
       return {
         action: 'deny',
         reason: 'Docker validation is forbidden locally. Use `yarn validate` or `npm run validate` instead.'
       };
     }
 
-    const pkgManager = detectPackageManager(command, tokens);
-
-    if (pkgManager === 'npm') {
-      const targetsYarnRepo = YARN_REPOS_PATTERN.test(segment);
-      const inYarnRepo = /(?:^|\/)(ingress-events-core|iitc-plugin-site-observer)(?:\/|$)/.test(normalizedCwd);
-      const targetsNpmRepo = NPM_REPOS_PATTERN.test(segment) || /\bingress-events-ai-kit\b/i.test(segment);
-
-      if (targetsYarnRepo || (inYarnRepo && !targetsNpmRepo)) {
-        return {
-          action: 'deny',
-          reason: 'Stack violation: `ingress-events-core` and `iitc-plugin-site-observer` use Yarn, not npm.'
-        };
-      }
+    const stackDeny = evaluateStackViolation(segment, normalizedCwd);
+    if (stackDeny) {
+      return stackDeny;
     }
 
-    if (pkgManager === 'yarn') {
-      const targetsNpmRepo = NPM_REPOS_PATTERN.test(segment);
-      const inNpmRepo = /(?:^|\/)ingress-shards\.github\.io(?:\/|$)/.test(normalizedCwd);
-      const targetsYarnRepo = YARN_REPOS_PATTERN.test(segment);
-
-      if (targetsNpmRepo || (inNpmRepo && !targetsYarnRepo)) {
-        return {
-          action: 'deny',
-          reason: 'Stack violation: `ingress-shards.github.io` uses npm, not Yarn.'
-        };
-      }
-    }
-  }
-
-  let pendingForceAsk = null;
-
-  for (const segment of segments) {
-    const rawTokens = tokenize(segment);
-    const { command, tokens } = unwrapCommandTokens(rawTokens);
-
-    if (command === 'git') {
-      const gitResult = evaluateGitSegment(tokens);
-      if (gitResult.action === 'deny') {
-        return gitResult;
-      }
-      if (gitResult.action === 'force_ask' && !pendingForceAsk) {
-        pendingForceAsk = gitResult;
-      }
+    if (!pendingForceAsk && MUTATING_GIT_PATTERN.test(segment)) {
+      pendingForceAsk = {
+        action: 'force_ask',
+        reason: 'Non-read-only git commands require explicit user approval ("Execute git commands").'
+      };
     }
 
-    if (command === 'node' && tokens.some((token) => /(?:^|[\\/])sync\.mjs$/i.test(token)) && !tokens.includes('--dry-run')) {
-      if (!pendingForceAsk) {
-        pendingForceAsk = {
-          action: 'force_ask',
-          reason: 'Running `sync.mjs` without `--dry-run` executes mutating git commands and requires explicit approval ("Execute git commands").'
-        };
-      }
+    if (!pendingForceAsk && SYNC_SCRIPT_PATTERN.test(segment) && !/(?:^|\s)--dry-run(?:\s|$)/.test(segment)) {
+      pendingForceAsk = {
+        action: 'force_ask',
+        reason: 'Running `sync.mjs` without `--dry-run` executes mutating git commands and requires explicit approval ("Execute git commands").'
+      };
     }
   }
 
@@ -619,9 +411,14 @@ export function evaluateCommand(commandLine, { cwd = '', workspacePaths = [] } =
     return pendingForceAsk;
   }
 
-  if (segments.length === 1 && isKnownSafeSingleCommand(commandLine, normalizedCwd)) {
+  // Stage 4: Auto-approve only when every segment passes the syntax safety gate and matches an allow rule.
+  if (segments.length > 0 && segments.every((segment) => segmentMatchesAllowRules(segment, allowRules))) {
     return { action: 'allow' };
   }
 
-  return { action: 'ask' };
+  // Stage 5: Safe default for any unlisted or flagged command (reason proves the hook ran).
+  return {
+    action: 'ask',
+    reason: 'Not in ingress-events-ai-kit allowlist (evaluate-command).'
+  };
 }
