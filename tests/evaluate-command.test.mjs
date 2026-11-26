@@ -192,6 +192,8 @@ test('flags mutating git commands with force_ask, auto-allows allowlisted read-o
   const allowedReadOnly = [
     'git -C ingress-events-core status -s',
     'git -C ingress-events-core branch --show-current',
+    'git -C ingress-events-core tag --sort=-v:refname',
+    'git tag --sort=-v:refname',
     'git -C ingress-events-core diff',
     'git -C ingress-events-core diff --stat',
     'git -C ingress-events-core diff --staged',
@@ -214,6 +216,8 @@ test('flags mutating git commands with force_ask, auto-allows allowlisted read-o
     'git -C ingress-events-core branch -a',
     'git -C ingress-events-core branch --merged main',
     'git -C ingress-events-core tag --list',
+    'git -C ingress-events-core tag',
+    'git -C ingress-events-core tag --sort=-v:refname v1.0.0',
     'git -C ingress-events-core stash list',
     'git -C ingress-events-core stash show',
     'git -C ingress-events-core remote -v',

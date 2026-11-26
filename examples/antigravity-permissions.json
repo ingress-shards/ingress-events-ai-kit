@@ -51,11 +51,13 @@
       "command(regex:node --test)",
       "command(regex:git -C [A-Za-z0-9][A-Za-z0-9._-]* status -s)",
       "command(regex:git -C [A-Za-z0-9][A-Za-z0-9._-]* branch --show-current)",
+      "command(regex:git -C [A-Za-z0-9][A-Za-z0-9._-]* tag --sort=-v:refname)",
       "command(regex:git -C [A-Za-z0-9][A-Za-z0-9._-]* diff)",
       "command(regex:git -C [A-Za-z0-9][A-Za-z0-9._-]* diff (--stat|--staged|[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?\\.\\.\\.HEAD))",
       "command(regex:git -C [A-Za-z0-9][A-Za-z0-9._-]* (log|show|grep) .*)",
       "command(git status -s)",
       "command(git branch --show-current)",
+      "command(git tag --sort=-v:refname)",
       "command(git diff)",
       "command(regex:git diff (--stat|--staged|[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?\\.\\.\\.HEAD))",
       "command(regex:git (log|show|grep) .*)"
