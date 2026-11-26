@@ -8,6 +8,12 @@ import { fileURLToPath } from 'node:url';
 import { cleanArtifactsForCommand } from '../scripts/clean-artifacts.mjs';
 import { compileAllowRule, evaluateCommand, isIngressWorkspace } from '../scripts/evaluate-command.mjs';
 import { initUmbrella } from '../scripts/init-umbrella.mjs';
+import {
+  formatSummary,
+  inspectRepo,
+  parseLsRemote,
+  syncRepo
+} from '../skills/post-release-sync/scripts/sync.mjs';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const KIT_ROOT = resolve(TEST_DIR, '..');
@@ -608,13 +614,15 @@ test('no personal usernames or machine-specific paths exist in ingress-events-ai
   }
 });
 
-test('post-release-sync scripts/sync.mjs --dry-run runs standalone in temp dirs and rejects missing --repo value', () => {
+test('post-release-sync scripts/sync.mjs --dry-run runs standalone in temp dirs (including all 4 default repos) and rejects missing --repo value', () => {
   const syncScript = resolve(KIT_ROOT, 'skills/post-release-sync/scripts/sync.mjs');
   const tempParent = mkdtempSync(join(tmpdir(), 'ingress-sync-test-'));
 
   try {
     const tempCore = join(tempParent, 'ingress-events-core');
+    const tempAiKit = join(tempParent, 'ingress-events-ai-kit');
     mkdirSync(join(tempCore, '.git'), { recursive: true });
+    mkdirSync(join(tempAiKit, '.git'), { recursive: true });
 
     const fromParentOut = execFileSync('node', [syncScript, '--all', '--dry-run'], {
       cwd: tempParent,
@@ -622,6 +630,7 @@ test('post-release-sync scripts/sync.mjs --dry-run runs standalone in temp dirs 
     });
     assert.match(fromParentOut, /\[dry-run\]/);
     assert.match(fromParentOut, /ingress-events-core/);
+    assert.match(fromParentOut, /ingress-events-ai-kit/);
 
     const fromSiblingOut = execFileSync('node', [syncScript, '--all', '--dry-run'], {
       cwd: tempCore,
@@ -629,6 +638,7 @@ test('post-release-sync scripts/sync.mjs --dry-run runs standalone in temp dirs 
     });
     assert.match(fromSiblingOut, /\[dry-run\]/);
     assert.match(fromSiblingOut, /ingress-events-core/);
+    assert.match(fromSiblingOut, /ingress-events-ai-kit/);
 
     const singleRepoOut = execFileSync('node', [syncScript, '--repo', tempCore, '--dry-run'], {
       cwd: tmpdir(),
@@ -645,6 +655,171 @@ test('post-release-sync scripts/sync.mjs --dry-run runs standalone in temp dirs 
     assert.match(missingRepo.stderr, /--repo requires a repository path/);
   } finally {
     rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('post-release-sync parseLsRemote extracts remote heads and Git-sorted latest tag', () => {
+  const parsed = parseLsRemote(
+    [
+      '1111111\trefs/heads/main',
+      '2222222\trefs/heads/feat/active',
+      '4444444\trefs/tags/v0.10.0',
+      '3333333\trefs/tags/v0.9.1'
+    ].join('\n')
+  );
+  assert.equal(parsed.heads.get('main'), '1111111');
+  assert.equal(parsed.heads.get('feat/active'), '2222222');
+  assert.equal(parsed.latestTag, 'v0.10.0');
+});
+
+test('post-release-sync inspectRepo and syncRepo report GitHub drift, protect WIP repos, and safely sync ready repos', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'ingress-sync-git-'));
+  const git = (cwd, args) =>
+    execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+  try {
+    const bareRemote = join(tempRoot, 'origin.git');
+    const seedClone = join(tempRoot, 'seed');
+    const devClone = join(tempRoot, 'ingress-events-core');
+
+    git(tempRoot, ['init', '--bare', bareRemote]);
+    git(tempRoot, ['clone', bareRemote, seedClone]);
+    git(seedClone, ['config', 'user.name', 'Test User']);
+    git(seedClone, ['config', 'user.email', 'test@example.com']);
+    git(seedClone, ['checkout', '-B', 'main']);
+
+    writeFileSync(join(seedClone, 'README.md'), 'init\n');
+    git(seedClone, ['add', 'README.md']);
+    git(seedClone, ['commit', '-m', 'chore: init']);
+    git(seedClone, ['tag', 'v0.9.0']);
+    git(seedClone, ['push', '-u', 'origin', 'main']);
+    git(seedClone, ['push', 'origin', 'v0.9.0']);
+    git(bareRemote, ['symbolic-ref', 'HEAD', 'refs/heads/main']);
+
+    git(tempRoot, ['clone', bareRemote, devClone]);
+    git(devClone, ['config', 'user.name', 'Test User']);
+    git(devClone, ['config', 'user.email', 'test@example.com']);
+
+    git(devClone, ['checkout', '-b', 'feat/merged']);
+    git(devClone, ['checkout', 'main']);
+
+    git(devClone, ['checkout', '-b', 'feat/squashed']);
+    writeFileSync(join(devClone, 'squash.txt'), 'squash\n');
+    git(devClone, ['add', 'squash.txt']);
+    git(devClone, ['commit', '-m', 'feat: squash work']);
+    git(devClone, ['push', '-u', 'origin', 'feat/squashed']);
+    git(devClone, ['push', 'origin', '--delete', 'feat/squashed']);
+
+    git(devClone, ['checkout', 'main']);
+    git(devClone, ['checkout', '-b', 'feat/open']);
+    writeFileSync(join(devClone, 'open.txt'), 'open\n');
+    git(devClone, ['add', 'open.txt']);
+    git(devClone, ['commit', '-m', 'feat: open work']);
+    git(devClone, ['push', '-u', 'origin', 'feat/open']);
+
+    git(devClone, ['checkout', 'main']);
+    git(devClone, ['checkout', '-b', 'chore/local-wip']);
+    writeFileSync(join(devClone, 'wip.txt'), 'wip\n');
+    git(devClone, ['add', 'wip.txt']);
+    git(devClone, ['commit', '-m', 'chore: local wip']);
+
+    writeFileSync(join(seedClone, 'release.txt'), 'v0.10.0\n');
+    git(seedClone, ['add', 'release.txt']);
+    git(seedClone, ['commit', '-m', 'feat: release 0.10.0']);
+    git(seedClone, ['tag', 'v0.10.0']);
+    git(seedClone, ['push', 'origin', 'main']);
+    git(seedClone, ['push', 'origin', 'v0.10.0']);
+
+    git(devClone, ['checkout', 'feat/merged']);
+    writeFileSync(join(devClone, 'dirty.tmp'), 'uncommitted\n');
+
+    const dirtyReport = inspectRepo(devClone);
+    assert.equal(dirtyReport.isDirty, true);
+    assert.equal(dirtyReport.dirtyCount, 1);
+    assert.equal(dirtyReport.localLatestTag, 'v0.9.0');
+    assert.equal(dirtyReport.remoteLatestTag, 'v0.10.0');
+    assert.match(dirtyReport.mainStatus, /behind/);
+    assert.equal(dirtyReport.disposition, 'skip-dirty');
+    assert.deepEqual(dirtyReport.mergedBranches.map((b) => b.name), ['feat/merged']);
+    assert.deepEqual(dirtyReport.goneBranches.map((b) => b.name), ['feat/squashed']);
+    assert.deepEqual(dirtyReport.openBranches.map((b) => b.name).sort(), ['chore/local-wip', 'feat/open']);
+
+    const summaryText = formatSummary([dirtyReport], { dryRun: true });
+    assert.match(summaryText, /local=v0\.9\.0, github=v0\.10\.0/);
+    assert.match(summaryText, /main vs GitHub: .*behind/);
+    assert.match(summaryText, /Branch vs main: 0 ahead, 0 behind/);
+    assert.match(summaryText, /Prunable \(merged, -d\): feat\/merged/);
+    assert.match(summaryText, /Remote gone \(review -D\): feat\/squashed/);
+    assert.match(summaryText, /git -C ingress-events-core branch -D feat\/squashed/);
+
+    const logs = [];
+    const dirtySync = syncRepo(devClone, { dryRun: false, log: (msg) => logs.push(msg) });
+    assert.equal(dirtySync.skipped, true);
+    assert.equal(git(devClone, ['branch', '--show-current']), 'feat/merged');
+    assert.equal(existsSync(join(devClone, 'dirty.tmp')), true);
+
+    rmSync(join(devClone, 'dirty.tmp'));
+    git(devClone, ['checkout', 'feat/open']);
+    const activeReport = inspectRepo(devClone);
+    assert.equal(activeReport.branchVsMain?.ahead, 1);
+    const activeSummary = formatSummary([activeReport], { dryRun: true });
+    assert.match(activeSummary, /git -C ingress-events-core fetch origin main:main/);
+    assert.match(activeSummary, /git -C ingress-events-core rebase main/);
+    const activeSync = syncRepo(devClone, { dryRun: false, log: (msg) => logs.push(msg) });
+    assert.equal(activeSync.report.disposition, 'skip-active-branch');
+    assert.equal(activeSync.skipped, true);
+    assert.equal(git(devClone, ['branch', '--show-current']), 'feat/open');
+
+    git(devClone, ['checkout', 'feat/merged']);
+    const readyLogs = [];
+    const readySync = syncRepo(devClone, { dryRun: false, log: (msg) => readyLogs.push(msg) });
+    assert.equal(readySync.report.disposition, 'ready');
+    assert.equal(readySync.skipped, false);
+    assert.equal(git(devClone, ['branch', '--show-current']), 'main');
+    assert.match(git(devClone, ['tag', '--sort=-v:refname']), /^v0\.10\.0/);
+    const remainingBranches = git(devClone, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']).split(/\r?\n/);
+    assert.equal(remainingBranches.includes('feat/merged'), false);
+    assert.equal(remainingBranches.includes('feat/squashed'), true);
+    assert.equal(remainingBranches.includes('feat/open'), true);
+    assert.equal(remainingBranches.includes('chore/local-wip'), true);
+    assert.ok(readyLogs.some((line) => line.includes('git -C ingress-events-core branch -D feat/squashed')));
+
+    const upToDateLogs = [];
+    const upToDateSync = syncRepo(devClone, { dryRun: false, log: (msg) => upToDateLogs.push(msg) });
+    assert.equal(upToDateSync.report.disposition, 'up-to-date');
+    assert.equal(upToDateSync.skipped, false);
+    assert.ok(upToDateLogs.some((line) => line.includes('[up-to-date]')));
+    assert.ok(upToDateLogs.some((line) => line.includes('git -C ingress-events-core branch -D feat/squashed')));
+
+    // Native Git versionsort.suffix=- ranks stable v0.10.0 above v0.10.0-alpha.1
+    git(devClone, ['tag', 'v0.10.0-alpha.1']);
+    assert.equal(inspectRepo(devClone).localLatestTag, 'v0.10.0');
+
+    // Diverged main is safely skipped
+    writeFileSync(join(seedClone, 'remote-diverge.txt'), 'remote\n');
+    git(seedClone, ['add', 'remote-diverge.txt']);
+    git(seedClone, ['commit', '-m', 'chore: remote diverge']);
+    git(seedClone, ['push', 'origin', 'main']);
+    writeFileSync(join(devClone, 'ahead.txt'), 'ahead\n');
+    git(devClone, ['add', 'ahead.txt']);
+    git(devClone, ['commit', '-m', 'chore: ahead commit']);
+    const aheadReport = inspectRepo(devClone);
+    assert.match(aheadReport.mainStatus, /1 ahead/);
+    assert.equal(aheadReport.disposition, 'skip-diverged');
+    const aheadSync = syncRepo(devClone, { dryRun: false, log: () => {} });
+    assert.equal(aheadSync.skipped, true);
+
+    // Sibling worktree branch is annotated [worktree] via for-each-ref %(worktreepath)
+    git(devClone, ['reset', '--hard', 'origin/main']);
+    const wtDir = join(tempRoot, 'wt-open');
+    git(devClone, ['worktree', 'add', wtDir, 'feat/open']);
+    const wtReport = inspectRepo(devClone);
+    const openEntry = wtReport.openBranches.find((b) => b.name === 'feat/open');
+    assert.equal(openEntry?.inOtherWorktree, true);
+    assert.match(formatSummary([wtReport], { dryRun: true }), /feat\/open \[worktree\]/);
+    git(devClone, ['worktree', 'remove', wtDir]);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 
