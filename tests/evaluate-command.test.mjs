@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { cleanArtifactsForCommand } from '../scripts/clean-artifacts.mjs';
-import { evaluateCommand, isIngressWorkspace } from '../scripts/evaluate-command.mjs';
+import { compileAllowRule, evaluateCommand, isIngressWorkspace } from '../scripts/evaluate-command.mjs';
 import { initUmbrella } from '../scripts/init-umbrella.mjs';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -39,138 +39,105 @@ test('isIngressWorkspace matches Ingress repos, arbitrary parent folders with pr
 });
 
 test('passes through commands in unrelated workspaces', () => {
-  const result = evaluateCommand('Get-ChildItem && git push', {
+  const result = evaluateCommand('npm --prefix ingress-events-core test && git push', {
     cwd: UNRELATED_CWD,
     workspacePaths: [UNRELATED_CWD]
   });
   assert.equal(result.action, 'ask');
 });
 
-test('denies shell commands referencing .secrets', () => {
-  for (const cmd of ['git add .secrets', 'echo .secrets', 'node script.mjs .secrets', 'echo x>.secrets', 'sort <.secrets']) {
-    const result = evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN });
-    assert.equal(result.action, 'deny', `Expected deny for: ${cmd}`);
-  }
-});
-
-test('denies PowerShell cmdlets including Set-Location', () => {
-  for (const cmd of ['Get-ChildItem src', 'dir | Select-String foo', 'Test-Path package.json', 'Set-Location ingress-events-core']) {
-    const result = evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN });
-    assert.equal(result.action, 'deny', `Expected deny for: ${cmd}`);
-  }
-});
-
-test('denies shell file-inspection commands, inline node -e/-p, and piped bypasses', () => {
+test('denies shell commands referencing .secrets and local docker validation', () => {
   for (const cmd of [
-    'cat package.json',
-    'head -n 20 README.md',
-    'sed -n "1,10p" package.json',
-    'type package.json',
-    'node -e "console.log(1)"',
-    'node -p "1"',
-    'node -pe "1"',
-    'node --eval="console.log(1)"',
-    'node -r dotenv/config -e "console.log(1)"',
-    'node --input-type=module -e "console.log(1)"',
-    'echo ok && node --eval "console.log(1)"',
-    'git status | head -n 5',
-    'yes | node -e "console.log(1)"',
-    'echo ok\nnode -p "1"'
+    'git add .secrets',
+    'echo .secrets',
+    'node script.mjs .secrets',
+    'node --env-file=.secrets script.mjs',
+    'ENV=.secrets node script.mjs',
+    'cat .secrets; ls',
+    '(cat .secrets)',
+    'echo ok;.secrets',
+    '(.secrets)',
+    'echo x>.secrets',
+    'sort <.secrets',
+    'docker build .',
+    '/usr/bin/docker build .',
+    'yarn --cwd ingress-events-core validate:docker',
+    "git -C ingress-events-core log ' && docker build ."
   ]) {
     const result = evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN });
     assert.equal(result.action, 'deny', `Expected deny for: ${cmd}`);
   }
-  assert.equal(evaluateCommand('type-check', { cwd: FAKE_UMBRELLA_WIN }).action, 'ask');
-});
-
-test('denies git diff with file or path arguments while allowing flag-only git diff', () => {
-  const denied = [
-    'git diff README.md',
-    'git -C ingress-events-core diff src/index.ts',
-    'git diff --stat package.json',
-    'git diff -- README.md'
-  ];
-  for (const cmd of denied) {
-    assert.equal(evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN }).action, 'deny', `Expected deny for: ${cmd}`);
-  }
-
-  assert.equal(evaluateCommand('git -C ingress-events-core diff --stat', { cwd: FAKE_UMBRELLA_WIN }).action, 'allow');
-
-  const asked = [
-    'git diff',
-    'git -C ingress-events-core diff',
-    'git diff --staged',
-    'git diff --cached',
-    'git diff --name-only'
-  ];
-  for (const cmd of asked) {
-    assert.equal(evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN }).action, 'ask', `Expected ask for: ${cmd}`);
-  }
-});
-
-test('denies local Docker validation and chained cd commands (leading or piped)', () => {
-  assert.equal(evaluateCommand('yarn --cwd ingress-events-core validate:docker', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('docker build .', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('cd ingress-events-core && yarn validate', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('cd ingress-events-core; yarn validate', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('echo ok && cd ingress-events-core && yarn validate', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-});
-
-test('denies cross-stack npm and yarn mixups while allowing @ingress-shards/ingress-events-core installs in map app', () => {
-  assert.equal(evaluateCommand('npm --prefix ingress-events-core test', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('npm --prefix iitc-plugin-site-observer run validate', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('npm test', { cwd: CORE_CWD }).action, 'deny');
-  assert.equal(evaluateCommand('npm run validate', { cwd: OBSERVER_CWD }).action, 'deny');
-  assert.equal(evaluateCommand('echo | npm --prefix ingress-events-core test', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-
-  assert.equal(evaluateCommand('yarn --cwd ingress-shards.github.io validate', { cwd: FAKE_UMBRELLA_WIN }).action, 'deny');
-  assert.equal(evaluateCommand('yarn validate', { cwd: MAP_CWD }).action, 'deny');
 
   assert.equal(
-    evaluateCommand('npm install @ingress-shards/ingress-events-core@^0.9.1', { cwd: MAP_CWD }).action,
-    'ask'
-  );
-  assert.equal(
-    evaluateCommand('npm --prefix ingress-shards.github.io install @ingress-shards/ingress-events-core@^0.9.1', {
+    evaluateCommand('git -C ingress-events-core commit -m "docs: no validate:docker"', {
       cwd: FAKE_UMBRELLA_WIN
     }).action,
-    'ask'
+    'force_ask'
   );
 });
 
-test('auto-allows exact known-safe single commands while keeping chained or non-allowlisted commands as ask', () => {
-  const autoAllowed = [
-    { cmd: 'yarn --cwd ingress-events-core validate', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'corepack yarn --cwd iitc-plugin-site-observer validate', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'npm --prefix ingress-shards.github.io run validate', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'npm --prefix ingress-events-ai-kit test', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'git -C ingress-events-core status -s', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'git -C ingress-events-core diff --stat', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'node --test', cwd: KIT_CWD },
-    { cmd: 'yarn validate', cwd: CORE_CWD },
-    { cmd: 'npm run validate', cwd: MAP_CWD }
+test('denies cross-stack npm and yarn mixups per segment while scoping explicit targets and deferring compliant commands to native rules', () => {
+  const denied = [
+    { cmd: 'npm --prefix ingress-events-core test', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'C:\\tools\\npm.cmd --prefix ingress-events-core test', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm --prefix=ingress-events-core test', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm -C ingress-events-core test', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm --prefix iitc-plugin-site-observer run validate', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm test', cwd: CORE_CWD },
+    { cmd: 'npm --prefix . test', cwd: CORE_CWD },
+    { cmd: 'npm run validate', cwd: OBSERVER_CWD },
+    { cmd: 'yarn --cwd ingress-shards.github.io validate', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'corepack yarn --cwd ingress-shards.github.io validate', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'yarn --cwd=ingress-shards.github.io validate', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'yarn validate', cwd: MAP_CWD },
+    { cmd: 'yarn --cwd . validate', cwd: MAP_CWD },
+    { cmd: 'yarn --cwd ingress-events-ai-kit test', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'yarn test', cwd: KIT_CWD },
+    { cmd: 'echo ok && npm --prefix ingress-events-core test', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'git -C ingress-shards.github.io status -s && npm test', cwd: CORE_CWD },
+    { cmd: 'npm --prefix ingress-shards.github.io test && npm --prefix ingress-events-core test', cwd: FAKE_UMBRELLA_WIN }
   ];
 
-  for (const { cmd, cwd } of autoAllowed) {
-    const result = evaluateCommand(cmd, { cwd });
-    assert.equal(result.action, 'allow', `Expected allow for: ${cmd}`);
+  for (const { cmd, cwd } of denied) {
+    assert.equal(evaluateCommand(cmd, { cwd }).action, 'deny', `Expected deny for: ${cmd}`);
   }
 
-  const stillAsk = [
-    { cmd: 'yarn --cwd ingress-events-core validate && echo ok', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'yarn --cwd ingress-events-core build', cwd: FAKE_UMBRELLA_WIN },
-    { cmd: 'npm --prefix ingress-shards.github.io run prepare:data', cwd: FAKE_UMBRELLA_WIN }
+  const allowed = [
+    { cmd: 'yarn --cwd ingress-events-core validate', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm --prefix ingress-shards.github.io run validate', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'git -C ingress-events-core status -s && npm test', cwd: MAP_CWD },
+    { cmd: 'yarn --cwd new-sibling-repo validate:check', cwd: MAP_CWD },
+    { cmd: 'yarn --cwd new-sibling-repo validate:check', cwd: KIT_CWD },
+    { cmd: 'npm --prefix new-npm-repo test', cwd: CORE_CWD },
+    { cmd: 'npm --prefix new-npm-repo test', cwd: OBSERVER_CWD }
   ];
 
-  for (const { cmd, cwd } of stillAsk) {
-    const result = evaluateCommand(cmd, { cwd });
-    assert.equal(result.action, 'ask', `Expected ask for: ${cmd}`);
+  for (const { cmd, cwd } of allowed) {
+    assert.equal(evaluateCommand(cmd, { cwd }).action, 'allow', `Expected allow for: ${cmd}`);
+  }
+
+  const deferredToAsk = [
+    { cmd: 'yarn --cwd ingress-events-core build', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'yarn --cwd ingress-events-core validate 2>&1', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm --prefix ingress-shards.github.io run lint -c ingress-events-core', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'npm --prefix ingress-shards.github.io test -- src/foo.test.ts', cwd: FAKE_UMBRELLA_WIN },
+    { cmd: 'node --test tests/foo.test.mjs', cwd: KIT_CWD },
+    { cmd: 'npm install @ingress-shards/ingress-events-core@^0.9.1', cwd: MAP_CWD },
+    {
+      cmd: 'npm --prefix ingress-shards.github.io install @ingress-shards/ingress-events-core@^0.9.1',
+      cwd: FAKE_UMBRELLA_WIN
+    }
+  ];
+
+  for (const { cmd, cwd } of deferredToAsk) {
+    assert.equal(evaluateCommand(cmd, { cwd }).action, 'ask', `Expected ask for: ${cmd}`);
   }
 });
 
-test('strict read-only git allowlist flags non-read-only commands (including wrappers and pipes) with force_ask', () => {
+test('flags mutating git commands with force_ask, auto-allows allowlisted read-only git, and asks on others', () => {
   const nonReadOnly = [
     'git -C ingress-events-core commit -m "feat: add ornament"',
+    'git -C ingress-events-core commit -m "docs: mention npm"',
     'git -C ingress-events-core push origin main',
     'git -C ingress-events-core pull --ff-only',
     'git -C ingress-events-core add .',
@@ -184,21 +151,31 @@ test('strict read-only git allowlist flags non-read-only commands (including wra
     'git -C iitc-plugin-site-observer merge feature/test',
     'git -C ingress-shards.github.io rebase main',
     'git -C ingress-events-core reset --hard HEAD',
+    'git -C ingress-events-core worktree add ../wt feat/x',
+    'git -C ingress-events-core clean -fd',
+    'git -C ingress-events-core am patch.diff',
+    'git -C ingress-events-core apply patch.diff',
     'git -C ingress-events-core tag -d v1.0.0',
     'git -C ingress-events-core tag v1.0.1',
+    'git -C ingress-events-core tag --delete v1.0.0',
     'git -C ingress-events-core branch -D old-branch',
     'git -C ingress-events-core branch -l feat-reflog',
+    'git -C ingress-events-core branch -lv',
+    'git -C ingress-events-core branch --delete old-branch',
     'git -C ingress-events-core branch new-feat',
     'git -C ingress-events-core remote prune origin',
-    'git -C ingress-events-core remote -v update',
-    'git init',
+    'git -C ingress-events-core stash',
+    'git -C ingress-events-core stash save "wip"',
     'git -C ingress-events-core stash pop',
-    'echo ok | git push',
+    'git init',
     'git.exe commit -m "x"',
     '/usr/bin/git push',
     'FOO=1 git push',
     'env -i git push',
-    'git config --show-origin user.name val'
+    'git -C ingress-events-core status -s && git -C ingress-events-core push',
+    "git -C ingress-events-core log ' && git push",
+    "git -C ingress-events-core log \\'; git push; echo \\'",
+    'git -C ingress-events-core grep "foo\\"; git push; echo \\""'
   ];
 
   for (const cmd of nonReadOnly) {
@@ -206,32 +183,55 @@ test('strict read-only git allowlist flags non-read-only commands (including wra
     assert.equal(result.action, 'force_ask', `Expected force_ask for: ${cmd}`);
   }
 
-  const readOnly = [
+  const allowedReadOnly = [
+    'git -C ingress-events-core status -s',
+    'git -C ingress-events-core branch --show-current',
     'git -C ingress-events-core diff',
+    'git -C ingress-events-core diff --stat',
+    'git -C ingress-events-core diff --staged',
+    'git -C ingress-events-core diff v2...HEAD',
     'git -C ingress-events-core log -n 5',
     'git -C ingress-events-core show --stat',
-    'git -C ingress-events-core fetch origin --tags',
-    'git -C ingress-events-core grep foo',
-    'git -C ingress-events-core rev-parse HEAD',
-    'git -C ingress-events-core branch',
-    'git -C ingress-events-core branch -a',
-    'git -C ingress-events-core branch --list',
-    'git -C ingress-events-core branch --merged main',
-    'git -C ingress-events-core branch --show-current',
-    'git -C ingress-events-core tag --list',
-    'git -C ingress-events-core tag -l',
-    'git -C ingress-events-core tag --sort=-v:refname',
-    'git -C ingress-events-core stash list',
-    'git -C ingress-events-core remote -v'
+    'git -C ingress-events-core grep "git push"',
+    'git -C ingress-events-core grep "=>"',
+    "git -C ingress-events-core grep '$(literal)'"
   ];
 
-  for (const cmd of readOnly) {
+  for (const cmd of allowedReadOnly) {
+    const result = evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN });
+    assert.equal(result.action, 'allow', `Expected allow for read-only git: ${cmd}`);
+  }
+
+  const askedReadOnly = [
+    'git -C ingress-events-core diff README.md',
+    'git -C ingress-events-core fetch origin --tags',
+    'git -C ingress-events-core branch -a',
+    'git -C ingress-events-core branch --merged main',
+    'git -C ingress-events-core tag --list',
+    'git -C ingress-events-core stash list',
+    'git -C ingress-events-core stash show',
+    'git -C ingress-events-core remote -v',
+    'git -C ingress-events-core log $(git push)',
+    'git -C ingress-events-core log "$(git push)"',
+    'git -C ingress-events-core grep `git push`',
+    'git -C ingress-events-core grep "`git push`"',
+    'git -C ingress-events-core log (git push)',
+    'git -C ingress-events-core log @(git push)',
+    "git -C ingress-events-core log 'unclosed",
+    "git -C ingress-events-core log \\'",
+    'git -C ingress-events-core grep "foo\\"bar"',
+    'git -C ingress-events-core log > README.md',
+    'git -C ingress-events-core log 2>&1',
+    'git -C ingress-events-core show HEAD < /etc/passwd'
+  ];
+
+  for (const cmd of askedReadOnly) {
     const result = evaluateCommand(cmd, { cwd: FAKE_UMBRELLA_WIN });
     assert.equal(result.action, 'ask', `Expected ask for read-only git: ${cmd}`);
   }
 });
 
-test('sync.mjs requires force_ask without --dry-run (even piped) and passes through with --dry-run', () => {
+test('sync.mjs requires force_ask without --dry-run (per segment) and passes through with --dry-run', () => {
   assert.equal(
     evaluateCommand('node "/tools/skills/post-release-sync/scripts/sync.mjs" --all --dry-run', {
       cwd: FAKE_UMBRELLA_POSIX
@@ -245,14 +245,21 @@ test('sync.mjs requires force_ask without --dry-run (even piped) and passes thro
     'force_ask'
   );
   assert.equal(
-    evaluateCommand('echo ok | node "/tools/skills/post-release-sync/scripts/sync.mjs" --all', {
+    evaluateCommand(
+      'node "/tools/skills/post-release-sync/scripts/sync.mjs" --all --dry-run && node "/tools/skills/post-release-sync/scripts/sync.mjs" --all',
+      { cwd: FAKE_UMBRELLA_POSIX }
+    ).action,
+    'force_ask'
+  );
+  assert.equal(
+    evaluateCommand('echo --dry-run && node "/tools/skills/post-release-sync/scripts/sync.mjs" --all', {
       cwd: FAKE_UMBRELLA_POSIX
     }).action,
     'force_ask'
   );
 });
 
-test('guard-antigravity.mjs emits valid Antigravity PreToolUse JSON', () => {
+test('guard-antigravity.mjs emits valid Antigravity PreToolUse JSON and returns auto_approve for allowlisted commands in Ingress workspaces', () => {
   const script = resolve(KIT_ROOT, 'scripts/guard-antigravity.mjs');
 
   const denyOut = JSON.parse(
@@ -260,7 +267,7 @@ test('guard-antigravity.mjs emits valid Antigravity PreToolUse JSON', () => {
       input: JSON.stringify({
         cwd: FAKE_UMBRELLA_WIN,
         workspacePaths: [FAKE_UMBRELLA_WIN],
-        toolCall: { args: { CommandLine: 'Get-ChildItem' } }
+        toolCall: { args: { CommandLine: 'echo .secrets' } }
       }),
       encoding: 'utf8'
     })
@@ -279,7 +286,7 @@ test('guard-antigravity.mjs emits valid Antigravity PreToolUse JSON', () => {
   );
   assert.equal(forceAskOut.decision, 'force_ask');
 
-  const allowOut = JSON.parse(
+  const allowInWorkspaceOut = JSON.parse(
     execFileSync('node', [script], {
       input: JSON.stringify({
         cwd: FAKE_UMBRELLA_WIN,
@@ -288,9 +295,9 @@ test('guard-antigravity.mjs emits valid Antigravity PreToolUse JSON', () => {
       encoding: 'utf8'
     })
   );
-  assert.deepEqual(allowOut, { decision: 'allow' });
+  assert.deepEqual(allowInWorkspaceOut, { decision: 'auto_approve' });
 
-  const askOut = JSON.parse(
+  const askInWorkspaceOut = JSON.parse(
     execFileSync('node', [script], {
       input: JSON.stringify({
         cwd: FAKE_UMBRELLA_WIN,
@@ -299,7 +306,41 @@ test('guard-antigravity.mjs emits valid Antigravity PreToolUse JSON', () => {
       encoding: 'utf8'
     })
   );
-  assert.deepEqual(askOut, { decision: 'ask' });
+  assert.equal(askInWorkspaceOut.decision, 'ask');
+  assert.match(askInWorkspaceOut.reason, /allowlist/i);
+
+  const askUnrelatedOut = JSON.parse(
+    execFileSync('node', [script], {
+      input: JSON.stringify({
+        cwd: UNRELATED_CWD,
+        workspacePaths: [UNRELATED_CWD],
+        toolCall: { args: { CommandLine: 'yarn validate' } }
+      }),
+      encoding: 'utf8'
+    })
+  );
+  assert.deepEqual(askUnrelatedOut, { decision: 'ask' });
+
+  const workspacePathsOnlyOut = JSON.parse(
+    execFileSync('node', [script], {
+      input: JSON.stringify({
+        cwd: '',
+        workspacePaths: [FAKE_UMBRELLA_WIN],
+        toolCall: { args: { CommandLine: 'npm --prefix ingress-events-ai-kit test' } }
+      }),
+      encoding: 'utf8'
+    })
+  );
+  assert.deepEqual(workspacePathsOnlyOut, { decision: 'auto_approve' });
+
+  const malformedOut = JSON.parse(
+    execFileSync('node', [script], {
+      input: '{not valid json',
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+  );
+  assert.deepEqual(malformedOut, { decision: 'ask' });
 });
 
 test('guard-claude.mjs emits valid Claude Code PreToolUse JSON', () => {
@@ -356,6 +397,41 @@ test('guard-claude.mjs emits valid Claude Code PreToolUse JSON', () => {
     })
   );
   assert.deepEqual(passOut, {});
+});
+
+test('native permission template files parse cleanly with non-empty deny, ask, and allow lists', () => {
+  const agyTemplate = JSON.parse(readFileSync(resolve(KIT_ROOT, 'examples/antigravity-permissions.json'), 'utf8'));
+  const claudeTemplate = JSON.parse(readFileSync(resolve(KIT_ROOT, 'examples/claude-settings.json'), 'utf8'));
+
+  for (const section of [agyTemplate.permissionGrants, claudeTemplate.permissions]) {
+    assert.equal(typeof section, 'object');
+    for (const bucket of ['deny', 'ask', 'allow']) {
+      assert.ok(Array.isArray(section[bucket]) && section[bucket].length > 0, `Expected non-empty ${bucket} array`);
+      assert.ok(section[bucket].every((entry) => typeof entry === 'string' && entry.length > 0));
+    }
+  }
+
+  assert.equal(agyTemplate.permissionGrants.allow.includes('command(regex:node --test)'), true);
+
+  assert.equal(compileAllowRule(null), null);
+  assert.equal(compileAllowRule('not-a-rule'), null);
+  assert.equal(compileAllowRule('command()'), null);
+  assert.equal(compileAllowRule('command(regex:)'), null);
+  assert.equal(compileAllowRule('command(regex:[)'), null);
+  assert.equal(compileAllowRule('command(regex:.*)'), null);
+  assert.equal(compileAllowRule('command(regex:   .*)'), null);
+
+  for (const bucket of ['deny', 'ask', 'allow']) {
+    for (const entry of agyTemplate.permissionGrants[bucket]) {
+      if (!entry.startsWith('command(regex:') || !entry.endsWith(')')) {
+        continue;
+      }
+      const inner = entry.slice('command(regex:'.length, -1).trim();
+      for (const token of inner.split(/\s+/)) {
+        assert.doesNotThrow(() => new RegExp(`^(?:${token})$`), `Invalid token regex "${token}" in ${entry}`);
+      }
+    }
+  }
 });
 
 test('clean-artifacts.mjs removes build artifacts only on build/validate inside Ingress workspaces', () => {
@@ -444,6 +520,28 @@ test('skill relative script links resolve inside their own skill directory', () 
   }
 });
 
+test('all 4 declarative subagents exist and have tool-agnostic valid frontmatter and bodies', () => {
+  const agentNames = ['impact-researcher', 'plan-challenger', 'code-reviewer', 'parity-reviewer'];
+  const platformToolPattern =
+    /(?:^|[\s`,"'])(?:run_command|read_file|view_file|grep_search|edit_file|write_file|Bash|Grep|Glob|Read|Edit|Write)(?=[\s`,"',.:;)]|$)/;
+
+  for (const agentName of agentNames) {
+    const agentPath = resolve(KIT_ROOT, 'agents', `${agentName}.md`);
+    assert.equal(existsSync(agentPath), true, `Missing agent file: ${agentName}.md`);
+    const content = readFileSync(agentPath, 'utf8');
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    assert.ok(fmMatch, `Missing YAML frontmatter in ${agentName}.md`);
+    const keys = fmMatch[1]
+      .split(/\r?\n/)
+      .filter((line) => line.trim())
+      .map((line) => line.split(':')[0].trim());
+    assert.deepEqual(keys, ['name', 'description'], `Frontmatter keys in ${agentName}.md must be strictly name and description`);
+    assert.match(fmMatch[1], new RegExp(`^name:\\s*${agentName}\\s*$`, 'm'));
+    assert.match(fmMatch[1], /^description:\s*\S+/m);
+    assert.equal(platformToolPattern.test(content), false, `Found platform-specific tool name in ${agentName}.md`);
+  }
+});
+
 test('rules/AGENTS.md retains critical invariants and new architecture/learning directives', () => {
   const rulesText = readFileSync(resolve(KIT_ROOT, 'rules/AGENTS.md'), 'utf8');
   const requiredPhrases = [
@@ -466,7 +564,19 @@ test('rules/AGENTS.md retains critical invariants and new architecture/learning 
     'eslint.config.js',
     'tsconfig.tsbuildinfo',
     '0.0.0-semantically-released',
-    'walkthrough'
+    'walkthrough',
+    'impact-researcher',
+    'plan-challenger',
+    'code-reviewer',
+    'parity-reviewer',
+    'validate:check',
+    'main...HEAD',
+    'git worktree',
+    'branch --show-current',
+    'review-report',
+    'ingress-events-ai-kit',
+    'permissionGrants.allow',
+    'permissions.allow'
   ];
   for (const phrase of requiredPhrases) {
     assert.ok(rulesText.includes(phrase), `rules/AGENTS.md missing required phrase: ${phrase}`);
